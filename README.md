@@ -51,3 +51,14 @@ AUTO_CONFIRM=false
 
 Keep `AUTO_CONFIRM=false` so uncertain OCR output is shown with warnings before
 anything is written to Notion.
+
+## Deploy on Render
+
+The repository includes a `Dockerfile` and `render.yaml`. The Render Blueprint
+creates a free web service and asks for the five private values that are marked
+with `sync: false`. Secrets stay in Render and are never committed to GitHub.
+
+On Render, the bot automatically switches from local polling to a secured
+Telegram webhook. Render provides HTTPS and the public hostname; the application
+listens on Render's `PORT`. The free service can sleep after 15 minutes without
+incoming traffic, and the next Telegram webhook wakes it again.

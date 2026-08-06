@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: expenses-telegram-bot
+    runtime: docker
+    plan: free
+    autoDeployTrigger: commit
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_EXPENSES_DATA_SOURCE_ID
+        sync: false
+      - key: NOTION_WEEKS_DATA_SOURCE_ID
+        sync: false
+      - key: ALLOWED_TELEGRAM_USER_ID
+        sync: false
+      - key: WEEKLY_BUDGET
+        value: "20"
+      - key: TIMEZONE
+        value: Europe/Madrid
+      - key: OCR_LANGUAGES
+        value: spa+fra+eng
+      - key: AUTO_CONFIRM
+        value: "false"
+      - key: NOTION_API_VERSION
+        value: "2026-03-11"
+      - key: WEBHOOK_PATH
+        value: telegram

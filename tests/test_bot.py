@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
@@ -99,6 +99,37 @@ class NotionWeekTests(unittest.TestCase):
             {"property": "Statut", "select": {"equals": "Acheté"}},
             filters,
         )
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_render_environment_starts_a_secured_webhook(self):
+        application = MagicMock()
+        builder = MagicMock()
+        builder.token.return_value.build.return_value = application
+
+        with (
+            patch("bot.ApplicationBuilder", return_value=builder),
+            patch.dict(
+                os.environ,
+                {
+                    "PORT": "10000",
+                    "RENDER_EXTERNAL_HOSTNAME": "expenses-bot.onrender.com",
+                    "WEBHOOK_PATH": "telegram",
+                },
+                clear=False,
+            ),
+        ):
+            bot.main()
+
+        kwargs = application.run_webhook.call_args.kwargs
+        self.assertEqual(kwargs["listen"], "0.0.0.0")
+        self.assertEqual(kwargs["port"], 10000)
+        self.assertEqual(
+            kwargs["webhook_url"],
+            "https://expenses-bot.onrender.com/telegram",
+        )
+        self.assertEqual(len(kwargs["secret_token"]), 64)
+        application.run_polling.assert_not_called()
 
 
 if __name__ == "__main__":

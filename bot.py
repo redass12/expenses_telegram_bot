@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -833,7 +834,30 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(ok|cancel):"))
     application.add_error_handler(error_handler)
 
-    LOGGER.info("Bot démarré. AUTO_CONFIRM=%s", AUTO_CONFIRM)
+    port = os.getenv("PORT", "").strip()
+    hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if port and hostname:
+        webhook_path = os.getenv("WEBHOOK_PATH", "telegram").strip("/") or "telegram"
+        webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or hashlib.sha256(
+            TELEGRAM_BOT_TOKEN.encode("utf-8")
+        ).hexdigest()
+        webhook_url = f"https://{hostname}/{webhook_path}"
+        LOGGER.info(
+            "Bot démarré en mode webhook sur Render. AUTO_CONFIRM=%s",
+            AUTO_CONFIRM,
+        )
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=int(port),
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+            secret_token=webhook_secret,
+            bootstrap_retries=-1,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        return
+
+    LOGGER.info("Bot démarré en mode polling local. AUTO_CONFIRM=%s", AUTO_CONFIRM)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
