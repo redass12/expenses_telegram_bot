@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
@@ -48,6 +49,12 @@ WEEKLY_BUDGET = float(os.getenv("WEEKLY_BUDGET", "20"))
 AUTO_CONFIRM = os.getenv("AUTO_CONFIRM", "false").lower() in {"1", "true", "yes", "oui"}
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Madrid"))
 OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "spa+fra+eng")
+RAPIDOCR_ENABLED = os.getenv("RAPIDOCR_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "oui",
+}
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -65,6 +72,9 @@ NOTION.headers.update(
         "Notion-Version": NOTION_API_VERSION,
     }
 )
+
+_RAPID_OCR_ENGINE: Any | None = None
+_RAPID_OCR_LOCK = threading.Lock()
 
 IGNORE_ITEM_WORDS = {
     "total",
@@ -146,6 +156,60 @@ PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 DATE_RE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b")
+TEXT_DATE_RE = re.compile(
+    r"\b(\d{1,2})\s+([A-Za-zÀ-ÿ]{3,10})\.?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+MONTH_NUMBERS = {
+    "jan": 1,
+    "january": 1,
+    "janvier": 1,
+    "enero": 1,
+    "feb": 2,
+    "february": 2,
+    "fevrier": 2,
+    "febrero": 2,
+    "mar": 3,
+    "march": 3,
+    "mars": 3,
+    "marzo": 3,
+    "apr": 4,
+    "april": 4,
+    "avril": 4,
+    "abril": 4,
+    "may": 5,
+    "mai": 5,
+    "mayo": 5,
+    "jun": 6,
+    "june": 6,
+    "juin": 6,
+    "junio": 6,
+    "jul": 7,
+    "july": 7,
+    "juillet": 7,
+    "julio": 7,
+    "aug": 8,
+    "august": 8,
+    "aout": 8,
+    "agosto": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "septembre": 9,
+    "septiembre": 9,
+    "oct": 10,
+    "october": 10,
+    "octobre": 10,
+    "octubre": 10,
+    "nov": 11,
+    "november": 11,
+    "novembre": 11,
+    "noviembre": 11,
+    "dec": 12,
+    "december": 12,
+    "decembre": 12,
+    "diciembre": 12,
+}
 
 
 def normalize(text: str) -> str:
@@ -261,6 +325,117 @@ def _text_quality(text: str) -> float:
     return price_lines * 8 + total_lines * 10 + date_lines * 4 + min(len(lines), 40) + ratio * 5
 
 
+def _rapidocr_rows(
+    boxes: Any,
+    texts: Any,
+    scores: Any,
+) -> list[str]:
+    """Rebuild visual receipt rows from RapidOCR's individual text boxes."""
+    min_score = float(os.getenv("RAPIDOCR_MIN_SCORE", "0.45"))
+    entries: list[dict[str, Any]] = []
+    box_values = [] if boxes is None else boxes
+    text_values = [] if texts is None else texts
+    score_values = [] if scores is None else scores
+    for box, text, score in zip(box_values, text_values, score_values):
+        clean = re.sub(r"\s+", " ", str(text)).strip()
+        if not clean or float(score) < min_score:
+            continue
+        points = np.asarray(box, dtype=float)
+        left = float(points[:, 0].min())
+        top = float(points[:, 1].min())
+        bottom = float(points[:, 1].max())
+        height = max(1.0, bottom - top)
+        entries.append(
+            {
+                "text": clean,
+                "left": left,
+                "center": (top + bottom) / 2,
+                "height": height,
+            }
+        )
+
+    entries.sort(key=lambda entry: (entry["center"], entry["left"]))
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        if rows:
+            row = rows[-1]
+            tolerance = max(float(row["height"]), float(entry["height"])) * 0.65
+            if abs(float(entry["center"]) - float(row["center"])) <= tolerance:
+                row["entries"].append(entry)
+                count = len(row["entries"])
+                row["center"] = (
+                    float(row["center"]) * (count - 1) + float(entry["center"])
+                ) / count
+                row["height"] = max(float(row["height"]), float(entry["height"]))
+                continue
+        rows.append(
+            {
+                "center": entry["center"],
+                "height": entry["height"],
+                "entries": [entry],
+            }
+        )
+
+    rebuilt: list[str] = []
+    for row in rows:
+        ordered = sorted(row["entries"], key=lambda entry: entry["left"])
+        rebuilt.append(" ".join(entry["text"] for entry in ordered))
+    return rebuilt
+
+
+def _create_rapidocr_engine() -> Any:
+    from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+
+    return RapidOCR(
+        params={
+            "Global.log_level": "warning",
+            "Global.max_side_len": _bounded_int_env(
+                "RAPIDOCR_MAX_SIDE_LEN",
+                1600,
+                1000,
+                2000,
+            ),
+            "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+            "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            "Det.engine_type": EngineType.ONNXRUNTIME,
+            "Det.lang_type": LangDet.CH,
+            "Det.model_type": ModelType.TINY,
+            "Det.ocr_version": OCRVersion.PPOCRV6,
+            "Rec.engine_type": EngineType.ONNXRUNTIME,
+            "Rec.lang_type": LangRec.CH,
+            "Rec.model_type": ModelType.SMALL,
+            "Rec.ocr_version": OCRVersion.PPOCRV6,
+        }
+    )
+
+
+def read_receipt_with_rapidocr(path: str) -> tuple[str, str, float]:
+    global _RAPID_OCR_ENGINE
+
+    started = time.monotonic()
+    with _RAPID_OCR_LOCK:
+        if _RAPID_OCR_ENGINE is None:
+            _RAPID_OCR_ENGINE = _create_rapidocr_engine()
+        result = _RAPID_OCR_ENGINE(path)
+
+    lines = _rapidocr_rows(result.boxes, result.txts, result.scores)
+    text = "\n".join(lines)
+    if not text.strip():
+        raise ValueError("RapidOCR n’a détecté aucun texte.")
+    if _text_quality(text) < 20:
+        raise ValueError("Le résultat RapidOCR est trop incertain.")
+
+    confidence = float(np.mean(result.scores)) if len(result.scores) else 0.0
+    LOGGER.info(
+        "RapidOCR terminé en %.1fs lignes=%s score=%.1f confiance=%.2f",
+        time.monotonic() - started,
+        len(lines),
+        _text_quality(text),
+        confidence,
+    )
+    return text, "rapidocr/ppocrv6-tiny-small", confidence
+
+
 def read_receipt_text(path: str) -> tuple[str, str]:
     available = set(pytesseract.get_languages(config=""))
     requested = OCR_LANGUAGES.split("+")
@@ -324,21 +499,47 @@ def read_receipt_text(path: str) -> tuple[str, str]:
     return text, method
 
 
-def detect_purchase_date(lines: list[str]) -> date:
+def read_receipt(path: str) -> tuple[str, str, float | None]:
+    if RAPIDOCR_ENABLED:
+        try:
+            return read_receipt_with_rapidocr(path)
+        except Exception as exc:
+            LOGGER.warning("RapidOCR indisponible, repli Tesseract: %s", exc)
+    text, method = read_receipt_text(path)
+    return text, method, None
+
+
+def _find_purchase_date(lines: list[str]) -> date | None:
     for line in lines:
         match = DATE_RE.search(line)
-        if not match:
-            continue
-        day, month, year = map(int, match.groups())
-        if year < 100:
-            year += 2000
-        try:
-            candidate = date(year, month, day)
-            if date(2000, 1, 1) <= candidate <= date.today() + timedelta(days=1):
-                return candidate
-        except ValueError:
-            continue
-    return datetime.now(TIMEZONE).date()
+        if match:
+            day, month, year = map(int, match.groups())
+            if year < 100:
+                year += 2000
+            try:
+                candidate = date(year, month, day)
+                if date(2000, 1, 1) <= candidate <= date.today() + timedelta(days=1):
+                    return candidate
+            except ValueError:
+                pass
+
+        text_match = TEXT_DATE_RE.search(line)
+        if text_match:
+            day = int(text_match.group(1))
+            month = MONTH_NUMBERS.get(normalize(text_match.group(2)))
+            year = int(text_match.group(3))
+            if month:
+                try:
+                    candidate = date(year, month, day)
+                    if date(2000, 1, 1) <= candidate <= date.today() + timedelta(days=1):
+                        return candidate
+                except ValueError:
+                    pass
+    return None
+
+
+def detect_purchase_date(lines: list[str]) -> date:
+    return _find_purchase_date(lines) or datetime.now(TIMEZONE).date()
 
 
 def detect_merchant(lines: list[str]) -> str:
@@ -413,7 +614,7 @@ def _clean_item_name(raw_name: str) -> str:
     name = raw_name.strip(" .:-*|_")
     name = re.sub(r"^\d+\s*[x×]\s*", "", name, flags=re.IGNORECASE)
     name = re.sub(
-        r"\s+\d+[,.]\d{2,3}\s*[x×]\s*\d+(?:[,.]\d+)?\s*$",
+        r"\s+\d+[,.]\d{2,3}\s*[x×s]\s*\d+(?:[,.]\d+)?\s*$",
         "",
         name,
         flags=re.IGNORECASE,
@@ -467,6 +668,9 @@ def detect_items(lines: list[str]) -> list[dict[str, Any]]:
         ):
             continue
         if re.match(r"^[A-Z]\s+\d+\s*%", name, flags=re.IGNORECASE):
+            continue
+        letters_only = re.sub(r"[^A-Za-zÀ-ÿ]", "", name)
+        if len(letters_only) <= 3 and re.search(r"\d+[,.]\d{2}", name):
             continue
 
         price = parse_price(match.group(1))
@@ -549,19 +753,23 @@ def reconcile_items(
 
 
 def extract_receipt(path: str, receipt_fingerprint: str) -> dict[str, Any]:
-    text, ocr_method = read_receipt_text(path)
+    text, ocr_method, ocr_confidence = read_receipt(path)
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
 
     if not lines:
         raise ValueError("Aucun texte détecté. Reprends la photo bien à plat et avec plus de lumière.")
 
     merchant = detect_merchant(lines)
-    purchase_date = detect_purchase_date(lines)
+    detected_purchase_date = _find_purchase_date(lines)
+    purchase_date = detected_purchase_date or datetime.now(TIMEZONE).date()
     total = detect_total(lines)
     items = detect_items(lines)
     warnings: list[str] = []
 
-    if not any(DATE_RE.search(line) for line in lines):
+    if ocr_confidence is not None and ocr_confidence < 0.93:
+        warnings.append("Lecture difficile : vérifie attentivement les noms et montants.")
+
+    if detected_purchase_date is None:
         warnings.append("Date non détectée : date d’aujourd’hui utilisée.")
     if merchant == "Magasin non identifié":
         warnings.append("Magasin non identifié.")
@@ -790,7 +998,8 @@ def receipt_summary(receipt: dict[str, Any]) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id if update.effective_user else "inconnu"
     await update.message.reply_text(
-        "Envoie-moi une photo nette et complète du ticket.\n"
+        "Envoie-moi une photo complète du ticket.\n"
+        "Pour la meilleure lecture, envoie l’image comme fichier non compressé.\n"
         "Je vais lire les produits, les ajouter dans Notion et calculer le reste sur 20 €.\n\n"
         f"Ton identifiant Telegram est : {user_id}"
     )
@@ -802,23 +1011,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     message = update.message
-    if not message or not message.photo:
+    if not message:
         return
 
-    status = await message.reply_text("🔎 Lecture du ticket…")
-    photo = message.photo[-1]
-    telegram_file = await context.bot.get_file(photo.file_id)
+    if message.photo:
+        media = message.photo[-1]
+        suffix = ".jpg"
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        media = message.document
+        candidate_suffix = Path(message.document.file_name or "").suffix.lower()
+        suffix = candidate_suffix if candidate_suffix in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+    else:
+        return
+
+    status = await message.reply_text("🔎 Lecture avancée du ticket…")
+    telegram_file = await context.bot.get_file(media.file_id)
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             temp_path = tmp.name
         await telegram_file.download_to_drive(custom_path=temp_path)
 
         receipt = await asyncio.to_thread(
             extract_receipt,
             temp_path,
-            photo.file_unique_id,
+            media.file_unique_id,
         )
 
         if AUTO_CONFIRM:
@@ -918,7 +1136,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     application: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+    )
     application.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(ok|cancel):"))
     application.add_error_handler(error_handler)
 

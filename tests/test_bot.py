@@ -10,6 +10,12 @@ import bot
 
 
 class ReceiptParsingTests(unittest.TestCase):
+    RAPID_RECEIPT_TEXT = """LIDL SUPERMERCADOS S.A.U.
+PAN BOCADILLO 1,29x 2 2,58 A
+CIRUELA ROJA 0,71 A
+TOTAL 3,29
+28/07/2026 20:48:23"""
+
     def test_parse_price_understands_dot_and_comma_decimals(self):
         cases = {
             "0.93": 0.93,
@@ -22,6 +28,29 @@ class ReceiptParsingTests(unittest.TestCase):
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
                 self.assertEqual(bot.parse_price(raw), expected)
+
+    def test_detect_purchase_date_understands_written_month(self):
+        self.assertEqual(
+            bot.detect_purchase_date(["28 Jul 2026"]),
+            bot.date(2026, 7, 28),
+        )
+
+    def test_invalid_numeric_date_is_reported_as_uncertain(self):
+        text = """LIDL SUPERMERCADOS S.A.U.
+PAN BOCADILLO 2,58 A
+TOTAL 2,58
+28/87/2826 20:48:23"""
+
+        with patch(
+            "bot.read_receipt_with_rapidocr",
+            return_value=(text, "rapidocr/ppocrv6", 0.72),
+        ):
+            receipt = bot.extract_receipt("ticket.jpg", "invalid-date")
+
+        self.assertIn(
+            "Date non détectée : date d’aujourd’hui utilisée.",
+            receipt["warnings"],
+        )
 
     def test_detect_items_uses_line_total_not_weight_or_unit_price(self):
         lines = [
@@ -40,6 +69,15 @@ class ReceiptParsingTests(unittest.TestCase):
             ],
         )
         self.assertEqual(bot.detect_total(lines), 2.18)
+
+    def test_detect_items_removes_a_misread_multiplication_marker(self):
+        self.assertEqual(
+            bot.detect_items(["PAN BOCADILLO 1,29s 2 2,58 A"]),
+            [{"name": "PAN BOCADILLO", "price": 2.58, "type": "Alimentation"}],
+        )
+
+    def test_detect_items_ignores_a_degraded_tax_summary_row(self):
+        self.assertEqual(bot.detect_items(["a a 0.13 3,16 3,29"]), [])
 
     def test_reconcile_uses_missing_item_instead_of_negative_ticket_adjustment(self):
         items = [{"name": "Pain", "price": 1.0, "type": "Alimentation"}]
@@ -103,6 +141,81 @@ class ReceiptParsingTests(unittest.TestCase):
         self.assertEqual(method, "adaptive/psm6")
         image_to_string.assert_called_once()
         self.assertEqual(image_to_string.call_args.kwargs["timeout"], 35)
+
+    def test_rapidocr_boxes_are_reassembled_into_receipt_rows(self):
+        boxes = [
+            [[20, 10], [280, 10], [280, 30], [20, 30]],
+            [[20, 50], [170, 50], [170, 70], [20, 70]],
+            [[190, 51], [280, 51], [280, 71], [190, 71]],
+            [[360, 49], [430, 49], [430, 69], [360, 69]],
+            [[20, 90], [90, 90], [90, 110], [20, 110]],
+            [[360, 91], [430, 91], [430, 111], [360, 111]],
+        ]
+
+        self.assertEqual(
+            bot._rapidocr_rows(
+                bot.np.asarray(boxes),
+                bot.np.asarray([
+                    "LIDL SUPERMERCADOS S.A.U.",
+                    "PAN BOCADILLO",
+                    "1,29x 2",
+                    "2,58 A",
+                    "TOTAL",
+                    "3,29",
+                ]),
+                bot.np.asarray([0.99, 0.98, 0.97, 0.99, 0.99, 0.99]),
+            ),
+            [
+                "LIDL SUPERMERCADOS S.A.U.",
+                "PAN BOCADILLO 1,29x 2 2,58 A",
+                "TOTAL 3,29",
+            ],
+        )
+
+    def test_extract_receipt_prefers_rapidocr(self):
+        with (
+            patch(
+                "bot.read_receipt_with_rapidocr",
+                create=True,
+                return_value=(self.RAPID_RECEIPT_TEXT, "rapidocr/ppocrv6", 0.98),
+            ) as rapidocr,
+            patch("bot.read_receipt_text", side_effect=AssertionError("fallback called")),
+        ):
+            receipt = bot.extract_receipt("ticket.jpg", "rapid-primary")
+
+        rapidocr.assert_called_once_with("ticket.jpg")
+        self.assertEqual(receipt["ocr_method"], "rapidocr/ppocrv6")
+        self.assertEqual(receipt["total"], 3.29)
+
+    def test_extract_receipt_warns_when_rapidocr_confidence_is_low(self):
+        with patch(
+            "bot.read_receipt_with_rapidocr",
+            return_value=(self.RAPID_RECEIPT_TEXT, "rapidocr/ppocrv6", 0.82),
+        ):
+            receipt = bot.extract_receipt("ticket.jpg", "rapid-uncertain")
+
+        self.assertIn(
+            "Lecture difficile : vérifie attentivement les noms et montants.",
+            receipt["warnings"],
+        )
+
+    def test_extract_receipt_falls_back_to_tesseract(self):
+        with (
+            patch(
+                "bot.read_receipt_with_rapidocr",
+                create=True,
+                side_effect=RuntimeError("rapidocr unavailable"),
+            ) as rapidocr,
+            patch(
+                "bot.read_receipt_text",
+                return_value=(self.RAPID_RECEIPT_TEXT, "adaptive/psm6"),
+            ) as tesseract,
+        ):
+            receipt = bot.extract_receipt("ticket.jpg", "fallback")
+
+        rapidocr.assert_called_once_with("ticket.jpg")
+        tesseract.assert_called_once_with("ticket.jpg")
+        self.assertEqual(receipt["ocr_method"], "adaptive/psm6")
 
 
 class NotionWeekTests(unittest.TestCase):

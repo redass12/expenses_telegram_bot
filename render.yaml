@@ -27,6 +27,10 @@ services:
         value: "35"
       - key: OCR_TARGET_LONG_SIDE
         value: "1600"
+      - key: RAPIDOCR_ENABLED
+        value: "true"
+      - key: RAPIDOCR_MAX_SIDE_LEN
+        value: "1600"
       - key: AUTO_CONFIRM
         value: "false"
       - key: NOTION_API_VERSION

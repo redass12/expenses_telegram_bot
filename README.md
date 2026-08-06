@@ -18,11 +18,15 @@ the weekly spent and remaining amounts inside Notion.
 
 ## Receipt recognition
 
-Each Telegram image is deskewed and read six ways: three contrast/threshold
-variants with two Tesseract page-layout modes. The strongest result is parsed
-with locale-aware prices (`0.93`, `0,93`, `1.234,56`, and `1,234.56`). The parser
-uses a product line's final amount instead of its weight or unit price and checks
-that product lines reconcile with the receipt total.
+RapidOCR with PP-OCRv6 is the primary reader. It uses a memory-efficient text
+detector and multilingual recognizer, then rebuilds product rows from the text
+box coordinates. Tesseract remains available as an automatic fallback. The
+parser understands locale-aware prices (`0.93`, `0,93`, `1.234,56`, and
+`1,234.56`), uses a product line's final amount instead of its weight or unit
+price, and checks that product lines reconcile with the receipt total.
+
+Telegram compresses regular photos. For difficult or small-print receipts, send
+the image as a file/document so the bot receives the original resolution.
 
 Install the Tesseract language packs for Spanish, French, and English. On macOS:
 
@@ -46,6 +50,7 @@ Optional settings:
 WEEKLY_BUDGET=20
 TIMEZONE=Europe/Madrid
 OCR_LANGUAGES=spa+fra+eng
+RAPIDOCR_ENABLED=true
 AUTO_CONFIRM=false
 ```
 
