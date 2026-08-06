@@ -50,6 +50,60 @@ class ReceiptParsingTests(unittest.TestCase):
         self.assertEqual(reconciled[-1]["name"], "Article(s) non identifié(s)")
         self.assertTrue(warnings)
 
+    def test_lidl_screenshot_ignores_phone_ui_and_tax_suffixes(self):
+        lines = [
+            "02:37 = oll S G4):",
+            "E 28 Jul 2026 AE",
+            "LIDL SUPERMERCADOS S.A.U.",
+            "Paseo del Carmen N° 20",
+            "13250 Ciudad Real",
+            "PAN BOCADILLO 1,29x 2 2,58 A",
+            "CIRUELA ROJA 0,71 A",
+            "0,206 kg x 3,45 EUR/kg",
+            "TOTAL 3,29",
+            "ENTREGA 3,29",
+            "28/07/2026 20:48:23",
+            "IMP.: 3,29 EUR",
+            "A 4% 0,13 3,16 3,29",
+            "Suma 0,13 3,16 3,29",
+        ]
+
+        self.assertEqual(bot.detect_merchant(lines), "LIDL SUPERMERCADOS S.A.U.")
+        self.assertEqual(
+            bot.detect_items(lines),
+            [
+                {"name": "PAN BOCADILLO", "price": 2.58, "type": "Alimentation"},
+                {"name": "CIRUELA ROJA", "price": 0.71, "type": "Alimentation"},
+            ],
+        )
+        self.assertEqual(bot.detect_total(lines), 3.29)
+
+    def test_render_ocr_uses_one_bounded_high_value_attempt(self):
+        variants = [
+            ("contrast", "contrast-image"),
+            ("otsu", "otsu-image"),
+            ("adaptive", "adaptive-image"),
+        ]
+
+        with (
+            patch.dict(
+                os.environ,
+                {"OCR_MAX_ATTEMPTS": "1", "OCR_PASS_TIMEOUT_SECONDS": "35"},
+                clear=False,
+            ),
+            patch("bot.preprocess_images", return_value=variants),
+            patch("bot.pytesseract.get_languages", return_value=["spa", "fra", "eng"]),
+            patch(
+                "bot.pytesseract.image_to_string",
+                return_value="LIDL SUPERMERCADOS\nTOTAL 3,29",
+            ) as image_to_string,
+        ):
+            _, method = bot.read_receipt_text("ticket.jpg")
+
+        self.assertEqual(method, "adaptive/psm6")
+        image_to_string.assert_called_once()
+        self.assertEqual(image_to_string.call_args.kwargs["timeout"], 35)
+
 
 class NotionWeekTests(unittest.TestCase):
     def test_find_week_by_start_date_not_display_title(self):

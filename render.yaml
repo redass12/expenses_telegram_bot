@@ -21,6 +21,12 @@ services:
         value: Europe/Madrid
       - key: OCR_LANGUAGES
         value: spa+fra+eng
+      - key: OCR_MAX_ATTEMPTS
+        value: "1"
+      - key: OCR_PASS_TIMEOUT_SECONDS
+        value: "35"
+      - key: OCR_TARGET_LONG_SIDE
+        value: "1600"
       - key: AUTO_CONFIRM
         value: "false"
       - key: NOTION_API_VERSION

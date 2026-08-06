@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import unicodedata
 import uuid
 from datetime import date, datetime, timedelta
@@ -99,6 +100,9 @@ IGNORE_ITEM_WORDS = {
     "cambio",
     "efectivo",
     "tarjeta",
+    "entrega",
+    "imp",
+    "suma",
 }
 
 CATEGORY_KEYWORDS = {
@@ -111,6 +115,7 @@ CATEGORY_KEYWORDS = {
         "pollo", "pescado", "platano", "plátano", "fruta", "verdura",
         "queso", "yogur", "aceite", "agua", "zumo", "café", "azucar",
         "azúcar", "harina", "galleta", "chocolate", "pasta", "carne",
+        "ciruela",
     ],
     "Hygiène": [
         "savon", "shampoing", "dentifrice", "deodorant", "déodorant",
@@ -137,7 +142,7 @@ CATEGORY_KEYWORDS = {
 
 PRICE_RE = re.compile(
     r"(?<!\d)(-?(?:\d{1,3}(?:[ .]\d{3})+|\d+)[,.]\d{2})"
-    r"\s*(?:€|eur)?\s*$",
+    r"\s*(?:€|eur)?\s*(?:[A-Z])?\s*$",
     re.IGNORECASE,
 )
 DATE_RE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b")
@@ -150,6 +155,15 @@ def normalize(text: str) -> str:
 
 
 NORMALIZED_IGNORE_ITEM_WORDS = {normalize(word) for word in IGNORE_ITEM_WORDS}
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        LOGGER.warning("%s invalide ; valeur par défaut %s utilisée", name, default)
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def parse_price(raw: str) -> float:
@@ -211,9 +225,11 @@ def preprocess_images(path: str) -> list[tuple[str, np.ndarray]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
     longest_side = max(height, width)
-    scale = min(2.5, max(1.0, 2400 / longest_side))
-    if scale > 1.01:
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    target_long_side = _bounded_int_env("OCR_TARGET_LONG_SIDE", 1600, 1000, 2400)
+    scale = min(2.5, target_long_side / longest_side)
+    if abs(scale - 1.0) > 0.01:
+        interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=interpolation)
 
     gray = _deskew(gray)
     denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
@@ -252,15 +268,56 @@ def read_receipt_text(path: str) -> tuple[str, str]:
     if not languages:
         languages = "eng"
 
+    variants = dict(preprocess_images(path))
+    attempt_plan = [
+        ("adaptive", 6),
+        ("contrast", 4),
+        ("otsu", 6),
+        ("contrast", 6),
+        ("adaptive", 4),
+        ("otsu", 4),
+    ]
+    max_attempts = _bounded_int_env("OCR_MAX_ATTEMPTS", 2, 1, len(attempt_plan))
+    pass_timeout = _bounded_int_env("OCR_PASS_TIMEOUT_SECONDS", 35, 10, 120)
+
     candidates: list[tuple[float, str, str]] = []
-    for variant_name, image in preprocess_images(path):
-        for psm in (4, 6):
+    timed_out = 0
+    for variant_name, psm in attempt_plan[:max_attempts]:
+        method = f"{variant_name}/psm{psm}"
+        started = time.monotonic()
+        LOGGER.info("OCR tentative=%s timeout=%ss", method, pass_timeout)
+        try:
             text = pytesseract.image_to_string(
-                image,
+                variants[variant_name],
                 lang=languages,
                 config=f"--oem 1 --psm {psm} -c preserve_interword_spaces=1",
+                timeout=pass_timeout,
             )
-            candidates.append((_text_quality(text), f"{variant_name}/psm{psm}", text))
+        except RuntimeError as exc:
+            timed_out += 1
+            LOGGER.warning(
+                "OCR tentative=%s interrompue après %.1fs: %s",
+                method,
+                time.monotonic() - started,
+                exc,
+            )
+            continue
+        score = _text_quality(text)
+        candidates.append((score, method, text))
+        LOGGER.info(
+            "OCR tentative=%s terminée en %.1fs score=%.1f",
+            method,
+            time.monotonic() - started,
+            score,
+        )
+
+    if not candidates:
+        if timed_out:
+            raise TimeoutError(
+                "La lecture du ticket a pris trop de temps. "
+                "Recadre le ticket seul, puis renvoie la photo."
+            )
+        raise RuntimeError("Le moteur de lecture n’a produit aucun résultat.")
 
     score, method, text = max(candidates, key=lambda candidate: candidate[0])
     LOGGER.info("OCR retenu=%s score=%.1f candidats=%s", method, score, len(candidates))
@@ -285,7 +342,23 @@ def detect_purchase_date(lines: list[str]) -> date:
 
 
 def detect_merchant(lines: list[str]) -> str:
-    for line in lines[:10]:
+    merchant_markers = (
+        "aldi",
+        "alcampo",
+        "auchan",
+        "carrefour",
+        "dia",
+        "eroski",
+        "intermarche",
+        "leclerc",
+        "lidl",
+        "mercadona",
+        "monoprix",
+        "supermercado",
+        "supermarket",
+    )
+    candidates: list[tuple[str, str]] = []
+    for line in lines[:20]:
         clean = re.sub(r"[^A-Za-zÀ-ÿ0-9 '&.-]", " ", line)
         clean = re.sub(r"\s+", " ", clean).strip()
         normalized = normalize(clean)
@@ -295,8 +368,15 @@ def detect_merchant(lines: list[str]) -> str:
             and not DATE_RE.search(clean)
             and not PRICE_RE.search(clean)
             and not any(word in normalized for word in NORMALIZED_IGNORE_ITEM_WORDS)
+            and not re.match(r"^\d{1,2}\s+\d{2}\b", clean)
         ):
-            return clean[:80]
+            candidates.append((clean[:80], normalized))
+
+    for clean, normalized in candidates:
+        if any(marker in normalized for marker in merchant_markers):
+            return clean
+    if candidates:
+        return candidates[0][0]
     return "Magasin non identifié"
 
 
@@ -332,6 +412,12 @@ def detect_total(lines: list[str]) -> float | None:
 def _clean_item_name(raw_name: str) -> str:
     name = raw_name.strip(" .:-*|_")
     name = re.sub(r"^\d+\s*[x×]\s*", "", name, flags=re.IGNORECASE)
+    name = re.sub(
+        r"\s+\d+[,.]\d{2,3}\s*[x×]\s*\d+(?:[,.]\d+)?\s*$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
     name = re.sub(
         r"\s+\d+[,.]\d{2,3}\s*(?:kg|g|l|cl|ml|u|ud|uds)\b.*$",
         "",
@@ -379,6 +465,8 @@ def detect_items(lines: list[str]) -> list[dict[str, Any]]:
                 "base imponible",
             )
         ):
+            continue
+        if re.match(r"^[A-Z]\s+\d+\s*%", name, flags=re.IGNORECASE):
             continue
 
         price = parse_price(match.group(1))
