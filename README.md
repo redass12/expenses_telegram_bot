@@ -18,12 +18,14 @@ the weekly spent and remaining amounts inside Notion.
 
 ## Receipt recognition
 
-RapidOCR with PP-OCRv6 is the primary reader. It uses a memory-efficient text
-detector and multilingual recognizer, then rebuilds product rows from the text
-box coordinates. Tesseract remains available as an automatic fallback. The
-parser understands locale-aware prices (`0.93`, `0,93`, `1.234,56`, and
-`1,234.56`), uses a product line's final amount instead of its weight or unit
-price, and checks that product lines reconcile with the receipt total.
+When `GEMINI_API_KEY` is configured, the free-tier `gemini-3.5-flash`
+multimodal model is the primary reader. It extracts the merchant, purchase date,
+product lines, final line prices, and total as validated structured JSON.
+RapidOCR with PP-OCRv6 and Tesseract remain available as automatic local
+fallbacks. The parser understands locale-aware prices (`0.93`, `0,93`,
+`1.234,56`, and `1,234.56`), uses a product line's final amount instead of its
+weight or unit price, and checks that product lines reconcile with the receipt
+total.
 
 Telegram compresses regular photos. For difficult or small-print receipts, send
 the image as a file/document so the bot receives the original resolution.
@@ -50,9 +52,16 @@ Optional settings:
 WEEKLY_BUDGET=20
 TIMEZONE=Europe/Madrid
 OCR_LANGUAGES=spa+fra+eng
+GEMINI_API_KEY=your-new-gemini-key
+GEMINI_MODEL=gemini-3.5-flash
+GEMINI_TIMEOUT_SECONDS=90
 RAPIDOCR_ENABLED=true
 AUTO_CONFIRM=false
 ```
+
+Keep the Gemini key only in the local `.env` or the deployment's secret
+environment variables. Never commit it to the repository. If Gemini is
+unavailable, the bot automatically falls back to RapidOCR and then Tesseract.
 
 Keep `AUTO_CONFIRM=false` so uncertain OCR output is shown with warnings before
 anything is written to Notion.

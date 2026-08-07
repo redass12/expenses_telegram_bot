@@ -21,6 +21,12 @@ services:
         value: Europe/Madrid
       - key: OCR_LANGUAGES
         value: spa+fra+eng
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: GEMINI_TIMEOUT_SECONDS
+        value: "90"
       - key: OCR_MAX_ATTEMPTS
         value: "1"
       - key: OCR_PASS_TIMEOUT_SECONDS

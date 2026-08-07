@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import json
 import logging
+import mimetypes
 import os
 import re
 import tempfile
@@ -13,6 +16,7 @@ import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import cv2
@@ -49,6 +53,8 @@ WEEKLY_BUDGET = float(os.getenv("WEEKLY_BUDGET", "20"))
 AUTO_CONFIRM = os.getenv("AUTO_CONFIRM", "false").lower() in {"1", "true", "yes", "oui"}
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Madrid"))
 OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "spa+fra+eng")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 RAPIDOCR_ENABLED = os.getenv("RAPIDOCR_ENABLED", "true").lower() in {
     "1",
     "true",
@@ -436,6 +442,198 @@ def read_receipt_with_rapidocr(path: str) -> tuple[str, str, float]:
     return text, "rapidocr/ppocrv6-tiny-small", confidence
 
 
+def read_receipt_with_gemini(path: str) -> tuple[str, str, float | None]:
+    """Use Gemini vision to extract a receipt into parser-safe canonical rows."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY n’est pas configurée.")
+
+    mime_type = mimetypes.guess_type(path)[0] or "image/jpeg"
+    if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}:
+        mime_type = "image/jpeg"
+
+    with open(path, "rb") as image_file:
+        image_data = base64.b64encode(image_file.read()).decode("ascii")
+
+    response_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "merchant": {
+                "type": ["string", "null"],
+                "description": "Exact merchant name printed on the receipt, or null if unreadable.",
+            },
+            "purchase_date": {
+                "type": ["string", "null"],
+                "format": "date",
+                "description": "Purchase date as YYYY-MM-DD, or null if unreadable.",
+            },
+            "items": {
+                "type": "array",
+                "description": "Purchased product lines only; exclude taxes, subtotals, payments and change.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Product name as printed, without quantity, unit price or tax suffix.",
+                        },
+                        "price": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": "Final amount paid for the full product line, not weight or unit price.",
+                        },
+                    },
+                    "required": ["name", "price"],
+                },
+            },
+            "total": {
+                "type": ["number", "null"],
+                "minimum": 0,
+                "description": "Final receipt total, or null if unreadable.",
+            },
+            "transcription": {
+                "type": "string",
+                "description": "Line-by-line transcription of visible receipt text only.",
+            },
+            "uncertain_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short names of fields that were genuinely difficult to read.",
+            },
+        },
+        "required": [
+            "merchant",
+            "purchase_date",
+            "items",
+            "total",
+            "transcription",
+            "uncertain_fields",
+        ],
+    }
+    prompt = (
+        "Extract this shopping receipt accurately. Ignore phone UI, app chrome, and text outside "
+        "the receipt. Preserve product names in their original language. For each product, use the "
+        "final line amount paid—not its weight, quantity, unit price, tax rate, subtotal, payment, "
+        "or change. Never invent unreadable text or numbers; use null/omit the product and name the "
+        "uncertain field instead. Ensure the product amounts are consistent with the printed total."
+    )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "data": image_data,
+                            "mimeType": mime_type,
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": response_schema,
+            "maxOutputTokens": 4096,
+        },
+    }
+
+    started = time.monotonic()
+    response = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{quote(GEMINI_MODEL, safe='')}:generateContent",
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=_bounded_int_env("GEMINI_TIMEOUT_SECONDS", 90, 15, 180),
+    )
+    if not response.ok:
+        raise RuntimeError(f"Erreur Gemini OCR HTTP {response.status_code}.")
+
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Gemini OCR a renvoyé une réponse invalide.") from exc
+
+    try:
+        parts = response_payload["candidates"][0]["content"]["parts"]
+        json_text = "".join(
+            part.get("text", "") for part in parts if isinstance(part, dict)
+        )
+        extracted = json.loads(json_text)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("Gemini OCR n’a renvoyé aucun résultat exploitable.") from exc
+
+    if not isinstance(extracted, dict):
+        raise RuntimeError("Gemini OCR a renvoyé un format inattendu.")
+
+    canonical_lines: list[str] = []
+    merchant = extracted.get("merchant")
+    if isinstance(merchant, str) and merchant.strip():
+        canonical_lines.append(re.sub(r"\s+", " ", merchant).strip())
+
+    purchase_date = extracted.get("purchase_date")
+    if isinstance(purchase_date, str):
+        try:
+            parsed_date = date.fromisoformat(purchase_date)
+            if date(2000, 1, 1) <= parsed_date <= date.today() + timedelta(days=1):
+                canonical_lines.append(parsed_date.strftime("%d/%m/%Y"))
+        except ValueError:
+            pass
+
+    for item in extracted.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        price = item.get("price")
+        if (
+            isinstance(name, str)
+            and name.strip()
+            and isinstance(price, (int, float))
+            and not isinstance(price, bool)
+            and 0 <= float(price) < 100000
+        ):
+            clean_name = re.sub(r"\s+", " ", name).strip()
+            canonical_lines.append(f"{clean_name} {float(price):.2f}".replace(".", ","))
+
+    total = extracted.get("total")
+    if (
+        isinstance(total, (int, float))
+        and not isinstance(total, bool)
+        and 0 <= float(total) < 100000
+    ):
+        canonical_lines.append(f"TOTAL {float(total):.2f}".replace(".", ","))
+
+    if not canonical_lines:
+        transcription = extracted.get("transcription")
+        if isinstance(transcription, str) and transcription.strip():
+            canonical_lines = [
+                re.sub(r"\s+", " ", line).strip()
+                for line in transcription.splitlines()
+                if line.strip()
+            ]
+
+    text = "\n".join(canonical_lines).strip()
+    if not text:
+        raise RuntimeError("Gemini OCR n’a renvoyé aucun texte exploitable.")
+
+    uncertain_fields = extracted.get("uncertain_fields", [])
+    confidence = 0.82 if isinstance(uncertain_fields, list) and uncertain_fields else 0.98
+    LOGGER.info(
+        "Gemini OCR terminé en %.1fs lignes=%s modèle=%s score=%.1f incertitudes=%s",
+        time.monotonic() - started,
+        len(canonical_lines),
+        GEMINI_MODEL,
+        _text_quality(text),
+        len(uncertain_fields) if isinstance(uncertain_fields, list) else 0,
+    )
+    return text, f"gemini/{GEMINI_MODEL}", confidence
+
+
 def read_receipt_text(path: str) -> tuple[str, str]:
     available = set(pytesseract.get_languages(config=""))
     requested = OCR_LANGUAGES.split("+")
@@ -500,6 +698,11 @@ def read_receipt_text(path: str) -> tuple[str, str]:
 
 
 def read_receipt(path: str) -> tuple[str, str, float | None]:
+    if GEMINI_API_KEY:
+        try:
+            return read_receipt_with_gemini(path)
+        except Exception as exc:
+            LOGGER.warning("Gemini indisponible, repli OCR local : %s", exc)
     if RAPIDOCR_ENABLED:
         try:
             return read_receipt_with_rapidocr(path)

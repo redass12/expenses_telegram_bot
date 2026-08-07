@@ -1,10 +1,12 @@
 import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("NOTION_TOKEN", "test-token")
+os.environ.setdefault("GEMINI_API_KEY", "")
 
 import bot
 
@@ -28,6 +30,74 @@ TOTAL 3,29
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
                 self.assertEqual(bot.parse_price(raw), expected)
+
+    def test_gemini_is_primary_when_api_key_is_configured(self):
+        response = MagicMock(ok=True)
+        response.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": """{
+                                    \"merchant\": \"LIDL SUPERMERCADOS S.A.U.\",
+                                    \"purchase_date\": \"2026-07-28\",
+                                    \"items\": [
+                                        {\"name\": \"PAN BOCADILLO\", \"price\": 2.58},
+                                        {\"name\": \"CIRUELA ROJA\", \"price\": 0.71}
+                                    ],
+                                    \"total\": 3.29,
+                                    \"transcription\": \"receipt text\",
+                                    \"uncertain_fields\": []
+                                }"""
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        with (
+            tempfile.NamedTemporaryFile(suffix=".jpg") as image,
+            patch("bot.GEMINI_API_KEY", "test-gemini-key"),
+            patch("bot.requests.post", return_value=response) as post,
+            patch("bot.read_receipt_with_rapidocr", side_effect=AssertionError("local OCR called")),
+        ):
+            text, method, confidence = bot.read_receipt(image.name)
+
+        self.assertEqual(
+            text,
+            """LIDL SUPERMERCADOS S.A.U.
+28/07/2026
+PAN BOCADILLO 2,58
+CIRUELA ROJA 0,71
+TOTAL 3,29""",
+        )
+        self.assertEqual(method, "gemini/gemini-3.5-flash")
+        self.assertEqual(confidence, 0.98)
+        self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"], "test-gemini-key")
+        self.assertIn(
+            "models/gemini-3.5-flash:generateContent",
+            post.call_args.args[0],
+        )
+        generation_config = post.call_args.kwargs["json"]["generationConfig"]
+        self.assertEqual(generation_config["responseMimeType"], "application/json")
+        self.assertIn("responseJsonSchema", generation_config)
+
+    def test_gemini_failure_falls_back_to_local_ocr(self):
+        with (
+            tempfile.NamedTemporaryFile(suffix=".jpg") as image,
+            patch("bot.GEMINI_API_KEY", "test-gemini-key"),
+            patch("bot.requests.post", side_effect=bot.requests.RequestException("offline")),
+            patch(
+                "bot.read_receipt_with_rapidocr",
+                return_value=(self.RAPID_RECEIPT_TEXT, "rapidocr/ppocrv6", 0.98),
+            ) as rapidocr,
+        ):
+            result = bot.read_receipt(image.name)
+
+        self.assertEqual(result, (self.RAPID_RECEIPT_TEXT, "rapidocr/ppocrv6", 0.98))
+        rapidocr.assert_called_once_with(image.name)
 
     def test_detect_purchase_date_understands_written_month(self):
         self.assertEqual(
